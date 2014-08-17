@@ -14,7 +14,7 @@ import getpass
 import decimal
 import logging
 
-import asyncio, aiohttp
+import requests
 from pycoin.ecdsa import generator_secp256k1, public_pair_for_secret_exponent
 from pycoin.encoding import wif_to_tuple_of_secret_exponent_compressed, public_pair_to_sec, is_sec_compressed, EncodingError
 from Crypto.Cipher import ARC4
@@ -41,85 +41,84 @@ def print_coin(coin):
     return 'amount: {}; txid: {}; vout: {}; confirmations: {}'.format(coin['amount'], coin['txid'], coin['vout'], coin.get('confirmations', '?')) # simplify and make deterministic
 
 def get_block_count():
-    count= yield from rpc('getblockcount', [])
-    return int(count)
+    return int(rpc('getblockcount', []))
 
 def get_block_hash(block_index):
-    return(yield from rpc('getblockhash', [block_index]))
+    return rpc('getblockhash', [block_index])
 
 def is_valid (address):
-    return((yield from rpc('validateaddress', [address]))['isvalid'])
+    return rpc('validateaddress', [address])['isvalid']
 
 def is_mine (address):
-    return(yield from rpc('validateaddress', [address])['ismine'])
+    return rpc('validateaddress', [address])['ismine']
 
 def send_raw_transaction (tx_hex):
-    return(yield from rpc('sendrawtransaction', [tx_hex]))
+    return rpc('sendrawtransaction', [tx_hex])
 
 def get_raw_transaction (tx_hash, json=True):
     if json:
-        return(yield from rpc('getrawtransaction', [tx_hash, 1]))
+        return rpc('getrawtransaction', [tx_hash, 1])
     else:
-        return(yield from rpc('getrawtransaction', [tx_hash]))
+        return rpc('getrawtransaction', [tx_hash])
 
 def get_block (block_hash):
-    return(yield from rpc('getblock', [block_hash]))
+    return rpc('getblock', [block_hash])
 
 def get_block_hash (block_index):
-    return(yield from rpc('getblockhash', [block_index]))
+    return rpc('getblockhash', [block_index])
 
 def decode_raw_transaction (unsigned_tx_hex):
-    return(yield from rpc('decoderawtransaction', [unsigned_tx_hex]))
+    return rpc('decoderawtransaction', [unsigned_tx_hex])
 
 def get_wallet ():
-    addressgroupings = yield from rpc('listaddressgroupings', [])
-    for group in addressgroupings:
+    for group in rpc('listaddressgroupings', []):
         for bunch in group:
             yield bunch
 
 def get_mempool ():
-    return(yield from rpc('getrawmempool', []))
+    return rpc('getrawmempool', [])
 
 def get_info():
-    return(yield from rpc('getinfo', []))
+    return rpc('getinfo', [])
 
 def bitcoind_check (db):
     """Checks blocktime of last block to see if {} Core is running behind.""".format(config.BTC_NAME)
-    block_count = yield from rpc('getblockcount', [])
-    block_hash = yield from rpc('getblockhash', [block_count])
-    block = yield from rpc('getblock', [block_hash])
+    block_count = rpc('getblockcount', [])
+    block_hash = rpc('getblockhash', [block_count])
+    block = rpc('getblock', [block_hash])
     time_behind = time.time() - block['time']   # How reliable is the block time?!
     if time_behind > 60 * 60 * 2:   # Two hours.
         raise exceptions.BitcoindError('Bitcoind is running about {} seconds behind.'.format(round(time_behind)))
 
-def connect (url, payload, headers):
+def connect (host, payload, headers):
+    global bitcoin_rpc_session
+    if not bitcoin_rpc_session: bitcoin_rpc_session = requests.Session()
     TRIES = 12
     for i in range(TRIES):
         try:
-            response = yield from asyncio.Task(aiohttp.request('POST', url, data=json.dumps(payload),
-                headers=headers))
+            response = bitcoin_rpc_session.post(host, data=json.dumps(payload), headers=headers, verify=config.BACKEND_RPC_SSL_VERIFY)
             if i > 0: print('Successfully connected.', file=sys.stderr)
             return response
-        except aiohttp.ConnectionError:
-            print('Could not connect to Bitcoind. Sleeping for five seconds. (Try {}/{})'.format(i+1, TRIES), file=sys.stderr)
+        except requests.exceptions.SSLError as e:
+            raise e
+        except requests.exceptions.ConnectionError:
+            logging.debug('Could not connect to Bitcoind. (Try {}/{})'.format(i+1, TRIES))
             time.sleep(5)
     return None
 
 def wallet_unlock ():
-    getinfo = yield from get_info()
+    getinfo = get_info()
     if 'unlocked_until' in getinfo:
         if getinfo['unlocked_until'] >= 60:
             return True # Wallet is unlocked for at least the next 60 seconds.
         else:
             passphrase = getpass.getpass('Enter your Bitcoind[‐Qt] wallet passhrase: ')
             print('Unlocking wallet for 60 (more) seconds.')
-            yield from rpc('walletpassphrase', [passphrase, 60])
+            rpc('walletpassphrase', [passphrase, 60])
     else:
         return True    # Wallet is unencrypted.
 
-@asyncio.coroutine
 def rpc (method, params):
-    starttime = time.time()
     headers = {'content-type': 'application/json'}
     payload = {
         "method": method,
@@ -136,13 +135,13 @@ def rpc (method, params):
         f.write(payload)
     '''
 
-    response = yield from connect(config.BACKEND_RPC, payload, headers)
+    response = connect(config.BACKEND_RPC, payload, headers)
     if response == None:
         if config.TESTNET: network = 'testnet'
         else: network = 'mainnet'
         raise exceptions.BitcoindRPCError('Cannot communicate with {} Core. ({} is set to run on {}, is {} Core?)'.format(config.BTC_NAME, config.XCP_CLIENT, network, config.BTC_NAME))
-    elif response.status not in (200, 500):
-        raise exceptions.BitcoindRPCError(str(response.status) + ' ' + response.reason)
+    elif response.status_code not in (200, 500):
+        raise exceptions.BitcoindRPCError(str(response.status_code) + ' ' + response.reason)
 
     '''
     if config.UNITTEST:
@@ -151,7 +150,7 @@ def rpc (method, params):
     '''
 
     # Return result, with error handling.
-    response_json = yield from response.json()
+    response_json = response.json()
     if 'error' not in response_json.keys() or response_json['error'] == None:
         return response_json['result']
     elif response_json['error']['code'] == -5:   # RPC_INVALID_ADDRESS_OR_KEY
@@ -159,7 +158,7 @@ def rpc (method, params):
     elif response_json['error']['code'] == -4:   # Unknown private key (locked wallet?)
         # If address in wallet, attempt to unlock.
         address = params[0]
-        validate_address = yield from rpc('validateaddress', [address])
+        validate_address = rpc('validateaddress', [address])
         if validate_address['isvalid']:
             if validate_address['ismine']:
                 raise exceptions.BitcoindError('Wallet is locked.')
@@ -169,7 +168,7 @@ def rpc (method, params):
             raise exceptions.AddressError('Invalid address.')
     elif response_json['error']['code'] == -1 and response_json['message'] == 'Block number out of range.':
         time.sleep(10)
-        return(yield from rpc('getblockhash', [block_index]))
+        return rpc('getblockhash', [block_index])
 
     # elif config.UNITTEST:
     #     print(method)
@@ -432,7 +431,7 @@ def transaction (tx_info, encoding='auto', fee_per_kb=config.DEFAULT_FEE_PER_KB,
             if config.UNITTEST:
                 private_key_wif = config.UNITTEST_PRIVKEY[source]
             else:
-                private_key_wif = yield from rpc('dumpprivkey', [source])
+                private_key_wif = rpc('dumpprivkey', [source])
 
             # Derive public key.
             public_key_hex = private_key_to_public_key(private_key_wif)
@@ -460,8 +459,7 @@ def transaction (tx_info, encoding='auto', fee_per_kb=config.DEFAULT_FEE_PER_KB,
 
     # Check that the source is in wallet.
     if not config.UNITTEST and encoding in ('multisig') and not public_key:
-        ismine = yield from rpc('validateaddress', [source])
-        if not ismine['ismine']:
+        if not rpc('validateaddress', [source])['ismine']:
             raise exceptions.AddressError('Not one of your Bitcoin addresses:', source)
 
     # Check that the destination output isn't a dust output.
